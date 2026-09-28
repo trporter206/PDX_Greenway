@@ -1,0 +1,10 @@
+.venv/
+.venv-mac/
+cache/
+data/
+session.ps1
+*.PNG
+*.dump
+city_attributes.txt
+.DS_Store
+._*

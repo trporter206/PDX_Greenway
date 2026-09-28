@@ -1,0 +1,284 @@
+# Central settings for the whole pipeline.
+# Weights for scoring will live here too, so sensitivity runs are just config edits.
+
+project:
+  place_name: "Portland, Oregon, USA"   # used to fetch the city boundary
+  crs: 26910                            # NAD83 / UTM zone 10N (meters)
+  boundary_buffer_m: 500                # route slightly past city limits so edge trips aren't clipped
+
+database:
+  host: localhost
+  port: 5432
+  dbname: pdx_greenway
+  user: postgres
+  # password is read from the PGPASSWORD environment variable, never stored here
+
+city_data:
+  # PortlandMaps ArcGIS services (the old combined COP_OpenData service has been retired;
+  # layers now live in themed services like these)
+  base_url: "https://www.portlandmaps.com/arcgis/rest/services/Public"
+  services:
+    - Transportation
+    - Transportation_System_Plan
+    - PBOT_Sidewalk_Layers
+    - PBOT_Planning
+    - Street_Centerlines
+    - Boundaries
+    - PPD_Jurisdictional_Boundaries
+    - BPS_Thematic_Layers
+    - BPS_Planning_Projects
+    - BPS_GreenLoop
+    - Zoning
+    - Parks_Pathways_and_Trails
+    - PBOT_RecommendedBicycleRoutes
+  # Exact layer names as they appear in the services. Optionally add `service:` to
+  # pick a specific service when the same name appears in more than one.
+  # Run `python scripts/03_fetch_city_data.py --list` to confirm or correct these.
+  layers:
+    # --- segment scoring ---
+    - table: speed_limits
+      name: "Speed Limit"
+      service: Transportation
+    - table: traffic_volume
+      name: "Traffic Volume"
+      service: Transportation
+    - table: traffic_speed          # measured speeds, to compare against posted limits
+      name: "Traffic Speed"
+      service: Transportation
+    - table: traffic_classes        # TSP: intended role of each street (for major-street crossings)
+      name: "Traffic Classes"
+      service: Transportation_System_Plan
+    - table: sidewalks
+      name: "Sidewalks"
+      service: PBOT_Sidewalk_Layers
+    - table: sidewalk_completeness
+      name: "Sidewalk Completeness"
+      service: PBOT_Planning
+    # --- anchors, spine, scenario ---
+    - table: centers
+      name: "BPS Adopted Centers Boundaries"
+      service: BPS_Thematic_Layers
+    - table: willamette_greenway_trail
+      name: "Greenway trail"
+      service: BPS_Thematic_Layers
+    - table: rapp_subareas          # Reconnecting Albina Planning Project
+      name: "RAPP Subarea Boundaries"
+      service: BPS_Planning_Projects
+    # --- validation (step 12) ---
+    - table: bikeways_existing
+      name: "Existing bikeways"
+      service: Transportation
+    - table: bikeways_planned
+      name: "Planned (funded) bikeways"
+      service: Transportation
+    - table: bikeways_recommended
+      name: "Recommended (undeveloped or unfunded) bikeways"
+      service: Transportation
+    - table: major_public_trails
+      name: "Major Public Trails"
+      service: Zoning
+    # --- Arbutus comparison (steps 13-14) ---
+    - table: neighborhoods
+      name: "Portland Neighborhoods"
+      service: Boundaries
+    # --- boundary ---
+    - table: city_boundary_official
+      name: "City of Portland Boundary"
+      service: Boundaries
+
+elevation:
+  # USGS 3DEP bare-earth elevation, fetched in tiles and mosaicked
+  service: "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer"
+  resolution_m: 3          # 3 m is plenty for street grades and keeps the file manageable
+  tile_px: 2000
+  output: "data/dem/dem_3m.tif"
+
+canopy:
+  # Metro RLIS "Canopy 2019", prepared in QGIS (Raster > Projections > Warp):
+  # EPSG:26910, 3 m, nearest neighbour, extent of dem_3m.tif, Byte, DEFLATE.
+  # Values are canopy height (0 = no canopy); >= min_value counts as canopy.
+  raster: "data/canopy/canopy2019_3m.tif"
+  min_value: 1
+  side_offsets_m: [4.5, 9]   # sample lines this far either side of the centerline
+
+metrics:
+  slope_sample_m: 10         # elevation sampled every 10 m along each edge
+  canopy_sample_m: 3         # canopy sampled every 3 m (one cell)
+  # Grade clean-up (see step 06 docstring)
+  bridge_max_grade: 0.06     # bridges are engineered gentle; endpoint grades on split bridge
+                             # pieces can land in the trench or river below
+  short_edge_m: 15           # shorter edges take the grade of the streets they connect to
+  max_grade: 0.35            # anything steeper (except stairs) is treated as a data artifact
+
+scoring:
+  # Starting weights, from Torri's ranking (most to least important):
+  #   steepness > traffic stress > off-street > busy crossings > shade > sidewalks
+  # Each penalty runs 0 (ideal) to 1 (worst).
+  #   impedance = 1 + slope*p_slope + traffic*p_traffic + shade*p_shade + sidewalk*p_sidewalk
+  #   (with `standardize`, each weight is first adjusted for its penalty's spread)
+  #   off-street edges: impedance * (1 - offstreet * offstreet_discount)
+  #   cost (routing) = length_m * impedance + crossings * crossing_cost_m * crossings_weight
+  # These are a starting point; step 08 re-runs the analysis with other weightings.
+  weights:
+    slope: 1.0
+    traffic: 0.85
+    offstreet: 0.7
+    crossings: 0.55
+    shade: 0.4
+    sidewalk: 0.25
+
+  slope:
+    flat_grade: 0.02         # no penalty at or below
+    full_grade: 0.10         # full penalty at or above
+    steps_penalty: 1.0       # stairs
+
+  traffic:
+    speed_free_mph: 20       # no penalty at or below
+    speed_full_mph: 40       # full penalty at or above
+    # TSP traffic class -> penalty (worse of speed and class is used)
+    class_penalty: {LS: 0.0, NC: 0.3, TA: 0.4, DC: 0.6, MCT: 0.85, RT: 1.0, RTMCT: 1.0}
+    # used when an edge has no TSP class (outside the city, unmatched)
+    highway_penalty: {service: 0.0, living_street: 0.0, residential: 0.0, unclassified: 0.15,
+                      tertiary: 0.5, secondary: 0.75, primary: 1.0, trunk: 1.0}
+    # used when an edge has no speed limit
+    default_speed_mph: {service: 15, living_street: 15, residential: 20, unclassified: 25,
+                        tertiary: 30, secondary: 35, primary: 40, trunk: 45}
+
+  shade:
+    full_canopy_frac: 0.6    # canopy share at which the shade penalty reaches 0
+
+  sidewalk:
+    penalty: {both: 0.0, one: 0.5, none: 1.0}
+    unknown_penalty: 0.3
+    # alleys and other shared low-traffic streets aren't expected to have sidewalks
+    shared_street_penalty: 0.3
+    shared_street_types: [service, living_street, track]
+    polygon_offset_m: 8      # fallback: look for sidewalk polygons this far either side...
+    polygon_search_m: 5      # ...within this distance
+
+  crossings:
+    crossing_cost_m: 150     # one full busy-street crossing = this many extra meters (x weight)
+    major_classes: [DC, MCT, RT, RTMCT]
+    major_speed_mph: 35
+    major_highways: [primary, secondary, trunk, primary_link, secondary_link, trunk_link]
+
+  offstreet_discount: 0.3    # x offstreet weight: 0.7 * 0.3 = 21% cheaper
+
+  # Standardize the per-length penalties (slope, traffic, shade, sidewalk) so each
+  # factor's influence is proportional to its weight. Without this, a factor whose
+  # penalty varies a lot across the city (e.g. shade) outweighs its rank.
+  #   effective_weight = weight * (mean spread / this factor's spread)
+  # where spread = length-weighted standard deviation of the penalty.
+  standardize: true
+
+connectors:
+  # Cross-town connectors: least-cost routes between pairs of adopted centers
+  max_pair_distance_m: 7000   # straight-line distance between centers; longer trips are the spine's job
+  pair_weighting: equal       # every pair counts once
+  exclude_centers: []         # center names to leave out, e.g. ["Raleigh Hills"]
+  max_snap_m: 750             # warn if a center's snapped network node is farther than this
+
+corridors:
+  # Step 09: turn connector routes into continuous corridors
+  trim_m: 400             # ignore the first/last 400 m of each route (getting out of a center)
+  band_half_width_m: 100  # parallel streets within 100 m either side share a band. Portland's
+                          # standard block puts parallel streets ~80 m apart, so this
+                          # catches the next street over on each side (~200 m wide band)
+  parallel_max_angle: 30  # degrees; streets must run roughly the same direction to share a band
+  min_band_uses: 3        # a street stretch needs at least this much band support
+  min_length_m: 800       # shortest corridor kept
+  max_edge_impedance: 1.6 # a street this unpleasant can't carry a corridor itself (it can
+                          # still lend band support to a quieter parallel street)
+  gap_join_m: 150         # stretches of the same street separated by less than this are joined
+
+network:
+  # Step 10: re-route every connector pair with the step 09 corridors made cheaper,
+  # so routes pull onto them and link them into one connected network
+  corridor_discount: 0.3   # corridor edges cost 30% less in the second round
+  min_uses: 3              # a street needs this many (trimmed) second-round routes to be in the network
+  min_component_m: 1500    # disconnected pieces shorter than this are dropped
+
+stress:
+  # Step 11: re-run steps 07 (costs) -> 10 under alternative settings and count how
+  # often each street stays in the connector network.
+  n_random: 12          # extra runs with random weights (each 0.1-1.0), ignoring the ranking
+  seed: 2026
+  # named scenarios: settings that differ from the baseline config
+  scenarios:
+    equal_weights:
+      scoring: {weights: {slope: 0.6, traffic: 0.6, offstreet: 0.6, crossings: 0.6, shade: 0.6, sidewalk: 0.6}}
+    reversed_ranking:
+      scoring: {weights: {slope: 0.25, traffic: 0.4, offstreet: 0.55, crossings: 0.7, shade: 0.85, sidewalk: 1.0}}
+    traffic_first:
+      scoring: {weights: {slope: 0.85, traffic: 1.0}}
+    no_standardization:
+      scoring: {standardize: false}
+    no_offstreet_bonus:
+      scoring: {weights: {offstreet: 0.0}}
+    crossings_doubled:
+      scoring: {weights: {crossings: 1.1}}
+    gentle_discount:
+      network: {corridor_discount: 0.2}
+    strong_discount:
+      network: {corridor_discount: 0.4}
+
+validation:
+  # Step 12: compare the connector network with the city's bikeway layers
+  street_match_m: 15       # a city line within 15 m, running the same way, is the same street
+  street_match_share: 0.5  # ...covering at least half the edge
+  # categories, checked in this order (first match wins)
+  categories:
+    existing_greenway:     # neighborhood greenways and trails that exist today
+      - {table: bikeways_existing, facilities: [NG, TRL]}
+      - {table: major_public_trails}
+    planned:               # funded
+      - {table: bikeways_planned}
+    recommended:           # in city plans, unfunded
+      - {table: bikeways_recommended, exclude_facilities: [NONE]}
+    existing_bikeway:      # other existing bike facilities, mostly lanes on busier streets;
+      - {table: bikeways_existing}   # checked last: a bike lane on a nearby arterial is weak
+                                     # evidence for a walking corridor
+
+arbutus:
+  # Steps 13-14: find "Portland's Arbutus" among the connector network and compare it
+  # with Vancouver's Arbutus Greenway using the same OpenStreetMap-based measures.
+  place: "Vancouver, British Columbia, Canada"
+  osm_name: "Arbutus Greenway"
+  official_length_km: 9          # City of Vancouver
+  neighbourhoods: [Fairview, Kitsilano, Arbutus Ridge, Shaughnessy, Kerrisdale, Marpole]
+  context_buffer_m: 600          # OSM context fetched this far around the greenway
+
+  # candidate corridors in the Portland connector network
+  min_length_km: 6
+  max_length_km: 12
+  min_span_km: 5                 # straight-line distance end to end: it must cross the city
+  max_sinuosity: 1.4             # route length / straight-line span
+  max_overlap: 0.6               # drop a candidate sharing more than this with a better one
+
+  # measures
+  shop_radius_m: 400             # shops and food within a 5-minute walk
+  transit_radius_m: 400
+  park_radius_m: 100
+  center_radius_m: 400
+  min_neighborhood_m: 200        # a neighborhood counts if the corridor runs this far inside it
+  major_roads: [primary, secondary, trunk]
+
+  # composite score weights (each trait is ranked 0-1 across candidates first)
+  score_weights:
+    shops: 1.0
+    neighborhoods: 1.0
+    centers: 1.0
+    flatness: 1.0
+    buildable: 1.0               # a mix of existing greenway and gaps, peaking at buildable_target
+    robust: 1.0
+    parks: 0.5
+    transit: 0.5
+    few_crossings: 0.75
+  buildable_target: 0.6          # ideal share of the corridor that is already greenway or trail
+
+  # points of interest, profiled for the winner and the Arbutus (not part of the score)
+  poi:
+    passing_radius_m: 50         # things you pass right by on the path itself
+    nearby_radius_m: 400         # destinations within a 5-minute walk
+    passing: [bench, drinking_water, public_bookcase, artwork]
+    nearby: [school, place_of_worship, library, community_centre, community_garden, toilets, viewpoint]
